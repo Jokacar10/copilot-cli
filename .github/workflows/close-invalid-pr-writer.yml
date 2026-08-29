@@ -44,19 +44,67 @@ jobs:
             exit 0
           fi
 
-          if [ "$(jq '.pull_requests | length' <<<"$workflow_run")" -ne 1 ]; then
-            echo "Workflow run is not associated with exactly one PR; skipping."
+          run_head_sha="$(jq -r .head_sha <<<"$workflow_run")"
+          run_head_repo="$(jq -r '.head_repository.full_name // empty' <<<"$workflow_run")"
+          run_head_branch="$(jq -r '.head_branch // empty' <<<"$workflow_run")"
+
+          if [ -z "$run_head_repo" ] ||
+            [ -z "$run_head_branch" ] ||
+            [[ ! "$run_head_sha" =~ ^[0-9a-f]{40}$ ]] ||
+            [ "${run_head_repo#*/}" = "$run_head_repo" ] ||
+            [ -z "${run_head_repo%%/*}" ] ||
+            [ -z "${run_head_repo#*/}" ]; then
+            echo "Workflow run is missing valid head repository, branch, or SHA metadata; skipping."
             exit 0
           fi
 
-          pr_number="$(jq -r .pull_requests[0].number <<<"$workflow_run")"
-          run_head_sha="$(jq -r .head_sha <<<"$workflow_run")"
-          run_head_repo="$(jq -r '.head_repository.full_name // empty' <<<"$workflow_run")"
+          pull_request_count="$(jq '.pull_requests | length' <<<"$workflow_run")"
+          if [ "$pull_request_count" -eq 1 ]; then
+            pr_number="$(jq -r .pull_requests[0].number <<<"$workflow_run")"
+          elif [ "$pull_request_count" -eq 0 ]; then
+            run_head_owner="${run_head_repo%%/*}"
+            matching_prs="$(
+              gh api --method GET --paginate "repos/$GH_REPO/pulls" \
+                -f state=open \
+                -f head="$run_head_owner:$run_head_branch" \
+                -f per_page=100 |
+                jq -cs \
+                  --arg repo "$GH_REPO" \
+                  --arg head_repo "$run_head_repo" \
+                  --arg head_branch "$run_head_branch" \
+                  --arg head_sha "$run_head_sha" \
+                  'add | [
+                    .[] |
+                    select(
+                      .state == "open" and
+                      .base.repo.full_name == $repo and
+                      .head.repo.full_name == $head_repo and
+                      .head.ref == $head_branch and
+                      .head.sha == $head_sha
+                    )
+                  ]'
+            )"
+
+            if [ "$(jq 'length' <<<"$matching_prs")" -ne 1 ]; then
+              echo "Workflow run could not be uniquely associated with an open PR; skipping."
+              exit 0
+            fi
+            pr_number="$(jq -r '.[0].number' <<<"$matching_prs")"
+          else
+            echo "Workflow run is associated with multiple PRs; skipping."
+            exit 0
+          fi
+
+          if [[ ! "$pr_number" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Workflow run produced an invalid PR number; skipping."
+            exit 0
+          fi
+
           pr="$(gh api "repos/$GH_REPO/pulls/$pr_number")"
 
-          if [ -z "$run_head_repo" ] ||
-            [ "$(jq -r .base.repo.full_name <<<"$pr")" != "$GH_REPO" ] ||
+          if [ "$(jq -r .base.repo.full_name <<<"$pr")" != "$GH_REPO" ] ||
             [ "$(jq -r '.head.repo.full_name // empty' <<<"$pr")" != "$run_head_repo" ] ||
+            [ "$(jq -r .head.ref <<<"$pr")" != "$run_head_branch" ] ||
             [ "$(jq -r .head.sha <<<"$pr")" != "$run_head_sha" ]; then
             echo "PR #$pr_number no longer matches the workflow run head; skipping."
             exit 0
